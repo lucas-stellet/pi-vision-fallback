@@ -30,7 +30,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, InputEventResult } from "@earendil-works/pi-coding-agent";
-import type { ImageContent, Message } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 
 /** Configuration shape read from settings.json. */
 interface VisionFallbackConfig {
@@ -277,61 +277,159 @@ export default function (pi: ExtensionAPI): void {
 		const currentModel = ctx.model;
 		if (!currentModel) return; // can't tell which model is active
 
-		const key = modelKey(currentModel);
-		const matches = config.activeModels.some((m) => m.trim() === key);
-		if (!matches) return; // active model can handle images itself, or isn't listed
+		if (!isActiveForFallback(currentModel, config)) return;
 
 		const instruction = config.instruction?.trim() || DEFAULT_INSTRUCTION;
 		const prompt = buildSecondaryPrompt(event.text, images.length, instruction);
 
-		// Write images to a temp dir for the subprocess to read via @file.
-		const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-vision-fallback-"));
-		let imagePaths: string[] = [];
-		try {
-			imagePaths = await Promise.all(
-				images.map((img, idx) => writeImageToTempFile(img, idx, tmpDir)),
-			);
+		const result = await describeImages({
+			images,
+			prompt,
+			config,
+			cwd: ctx.cwd,
+			signal: ctx.signal,
+		});
 
-			const result = await runSecondaryModel({
-				model: config.secondaryModel,
-				thinking: config.thinking,
-				prompt,
-				imagePaths,
-				cwd: ctx.cwd,
-				signal: ctx.signal,
-			});
-
-			if (result.error) {
-				ctx.ui.notify(`vision-fallback: secondary model failed — ${result.error}`, "warning");
-				// Pass the original input through unchanged.
-				return { action: "continue" };
-			}
-
-			if (!result.description) {
-				ctx.ui.notify("vision-fallback: secondary model returned no description", "warning");
-				return { action: "continue" };
-			}
-
-			// Inject the description into the primary model's prompt and strip
-			// the raw images, which the text-only primary model cannot process.
-			const newText = buildInjectedPrompt(event.text, result.description);
-
-			ctx.ui.setStatus("vision-fallback", `described ${images.length} image(s)`);
-			return { action: "transform", text: newText, images: [] };
-		} finally {
-			// Best-effort cleanup of temp files.
-			await Promise.all(
-				imagePaths.map((p) =>
-					fs.promises.unlink(p).catch(() => {
-						/* ignore */
-					}),
-				),
-			);
-			await fs.promises.rmdir(tmpDir).catch(() => {
-				/* ignore */
-			});
+		if (result.error) {
+			ctx.ui.notify(`vision-fallback: secondary model failed — ${result.error}`, "warning");
+			return { action: "continue" };
 		}
+
+		if (!result.description) {
+			ctx.ui.notify("vision-fallback: secondary model returned no description", "warning");
+			return { action: "continue" };
+		}
+
+		// Inject the description into the primary model's prompt and strip
+		// the raw images, which the text-only primary model cannot process.
+		const newText = buildInjectedPrompt(event.text, result.description);
+
+		ctx.ui.setStatus("vision-fallback", `described ${images.length} image(s)`);
+		return { action: "transform", text: newText, images: [] };
 	});
+
+	// Second trigger path: when the model calls `read` on an image file while
+	// the active model is text-only, pi returns the raw ImageContent (which the
+	// model cannot process) plus a note that the image was omitted. Intercept
+	// that result, describe the image via the secondary model, and replace the
+	// content with a textual description so the primary model can use it.
+	pi.on("tool_result", async (event, ctx): Promise<{ content: (TextContent | ImageContent)[] } | void> => {
+		if (event.toolName !== "read") return;
+
+		const config = loadConfig();
+		if (!config) return;
+
+		const currentModel = ctx.model;
+		if (!currentModel) return;
+
+		// Only intercept when the active model actually lacks vision. If the
+		// active model can handle images, leave the raw ImageContent in place.
+		if (!isActiveForFallback(currentModel, config)) return;
+
+		const imageContents = event.content.filter(
+			(c): c is ImageContent => c.type === "image",
+		);
+		if (imageContents.length === 0) return; // not an image read
+
+		// Preserve any non-image text parts (e.g. processing hints).
+		const textParts = event.content.filter(
+			(c): c is TextContent => c.type === "text",
+		);
+		const readPath = String(event.input?.path ?? event.input?.file_path ?? "(unknown path)");
+
+		const instruction = config.instruction?.trim() || DEFAULT_INSTRUCTION;
+		const userContext = ctx.sessionManager.getBranch()
+			?.map((e) => (e.type === "message" && e.message?.role === "user" ? extractText(e.message) : undefined))
+			.filter((t): t is string => !!t)
+			.slice(-1)[0];
+		const prompt = buildSecondaryPrompt(userContext ?? readPath, imageContents.length, instruction);
+
+		const result = await describeImages({
+			images: imageContents,
+			prompt,
+			config,
+			cwd: ctx.cwd,
+			signal: ctx.signal,
+		});
+
+		if (result.error) {
+			ctx.ui.notify(`vision-fallback: secondary model failed — ${result.error}`, "warning");
+			return;
+		}
+
+		if (!result.description) {
+			ctx.ui.notify("vision-fallback: secondary model returned no description", "warning");
+			return;
+		}
+
+		const header = `[Descrição da imagem em ${readPath} gerada por modelo de visão]`;
+		const descriptionBlock = `${header}\n${result.description}`;
+
+		// Keep leading text hints (e.g. "Read image file [image/png]"), drop the
+		// raw image part and the "image omitted" note, append the description.
+		const keptText = textParts
+			.map((t) => t.text)
+			.filter((t) => !t.includes("image will be omitted from this request"))
+			.join("\n")
+			.trim();
+
+		const newContent: (TextContent | ImageContent)[] = [
+			{ type: "text", text: keptText ? `${keptText}\n\n${descriptionBlock}` : descriptionBlock },
+		];
+
+		ctx.ui.setStatus("vision-fallback", `described ${imageContents.length} image(s) from read`);
+		return { content: newContent };
+	});
+}
+
+/** Whether the active model is one that should receive fallback descriptions. */
+function isActiveForFallback(model: { provider: string; id: string }, config: VisionFallbackConfig): boolean {
+	const key = modelKey(model);
+	return config.activeModels.some((m) => m.trim() === key);
+}
+
+/** Pull text out of a message's content array (handles string or parts). */
+function extractText(message: { content?: string | Array<{ type: string; text?: string }> }): string {
+	if (!message.content) return "";
+	if (typeof message.content === "string") return message.content;
+	return message.content
+		.filter((p) => p.type === "text")
+		.map((p) => p.text ?? "")
+		.join("\n");
+}
+
+/** Shared image-description routine used by both trigger paths. */
+async function describeImages(args: {
+	images: ImageContent[];
+	prompt: string;
+	config: VisionFallbackConfig;
+	cwd: string;
+	signal?: AbortSignal;
+}): Promise<SecondaryResult> {
+	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-vision-fallback-"));
+	let imagePaths: string[] = [];
+	try {
+		imagePaths = await Promise.all(args.images.map((img, idx) => writeImageToTempFile(img, idx, tmpDir)));
+		return await runSecondaryModel({
+			model: args.config.secondaryModel,
+			thinking: args.config.thinking,
+			prompt: args.prompt,
+			imagePaths,
+			cwd: args.cwd,
+			signal: args.signal,
+		});
+	} finally {
+		await Promise.all(
+			imagePaths.map((p) =>
+				fs.promises.unlink(p).catch(() => {
+					/* ignore */
+				}),
+			),
+		);
+		await fs.promises.rmdir(tmpDir).catch(() => {
+			/* ignore */
+		});
+	}
 }
 
 /** Compose the final prompt that the primary (text-only) model receives. */
