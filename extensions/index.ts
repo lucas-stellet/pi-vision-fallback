@@ -338,11 +338,16 @@ export default function (pi: ExtensionAPI): void {
 		const readPath = String(event.input?.path ?? event.input?.file_path ?? "(unknown path)");
 
 		const instruction = config.instruction?.trim() || DEFAULT_INSTRUCTION;
-		const userContext = ctx.sessionManager.getBranch()
+		// Use the last user message as task context, but strip the file path that
+		// triggered this read so it doesn't contaminate the visual description.
+		// The secondary model already receives the image via @file; leaking the
+		// path (especially names like "cmux 2026-06-30 ...") biases the analysis.
+		const rawUserContext = ctx.sessionManager.getBranch()
 			?.map((e) => (e.type === "message" && e.message?.role === "user" ? extractText(e.message) : undefined))
 			.filter((t): t is string => !!t)
 			.slice(-1)[0];
-		const prompt = buildSecondaryPrompt(userContext ?? readPath, imageContents.length, instruction);
+		const userContext = sanitizeUserContext(rawUserContext, readPath);
+		const prompt = buildSecondaryPrompt(userContext, imageContents.length, instruction);
 
 		const result = await describeImages({
 			images: imageContents,
@@ -396,6 +401,24 @@ function extractText(message: { content?: string | Array<{ type: string; text?: 
 		.filter((p) => p.type === "text")
 		.map((p) => p.text ?? "")
 		.join("\n");
+}
+
+/**
+ * Remove the file path that triggered a read from the user's message text,
+ * so the secondary vision model isn't biased by the filename (e.g. names
+ * like "cmux 2026-06-30 22.16.34.png" leak semantic hints into the analysis).
+ * Handles both raw paths and shell-escaped variants ("\ ").
+ */
+function sanitizeUserContext(text: string | undefined, filePath: string): string {
+	if (!text) return "";
+	if (!filePath) return text;
+	let result = text;
+	// Remove the raw path and the shell-escaped variant (backslash-space).
+	const variants = [filePath, filePath.replace(/\s+/g, "\\ ")];
+	for (const v of variants) {
+		if (v) result = result.split(v).join("");
+	}
+	return result.replace(/\s{2,}/g, " ").trim();
 }
 
 /** Shared image-description routine used by both trigger paths. */
