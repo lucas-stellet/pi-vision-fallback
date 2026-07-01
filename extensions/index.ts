@@ -304,7 +304,6 @@ export default function (pi: ExtensionAPI): void {
 		// the raw images, which the text-only primary model cannot process.
 		const newText = buildInjectedPrompt(event.text, result.description);
 
-		ctx.ui.setStatus("vision-fallback", `described ${images.length} image(s)`);
 		return { action: "transform", text: newText, images: [] };
 	});
 
@@ -382,7 +381,6 @@ export default function (pi: ExtensionAPI): void {
 			{ type: "text", text: keptText ? `${keptText}\n\n${descriptionBlock}` : descriptionBlock },
 		];
 
-		ctx.ui.setStatus("vision-fallback", `described ${imageContents.length} image(s) from read`);
 		return { content: newContent };
 	});
 }
