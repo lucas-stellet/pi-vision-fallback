@@ -1,0 +1,17 @@
+{
+  "name": "@lucas/vision-fallback",
+  "version": "0.1.0",
+  "description": "Pi extension that describes images for text-only models by delegating to a vision-capable secondary model.",
+  "keywords": ["pi-package", "pi-extension", "vision", "fallback"],
+  "license": "MIT",
+  "author": "lucas",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
